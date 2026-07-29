@@ -4,6 +4,8 @@ RÈGLES STRICTES :
 - N'invente JAMAIS une information absente du texte. Si un champ n'est pas mentionné, mets null.
 - Un nom d'entreprise doit être un nom propre réel (pas "Empresa X" ou un placeholder).
 - Ignore les mentions génériques.
+- IGNORE TOTALEMENT les ministères, institutions publiques, organismes gouvernementaux, agences d'État, fonds publics et associations professionnelles (ex: MADER, FDA, APIEX, Ministério de..., Instituto Nacional de...). On ne veut QUE des entreprises privées commerciales, jamais une institution qui finance/régule/annonce.
+- Ignore aussi les grandes marques internationales génériques mentionnées en passant (ex: "Microsoft 365" cité comme outil utilisé) — seulement les entreprises qui SONT le sujet de l'article/fiche, pas celles juste mentionnées en référence.
 - Le champ "secteur" doit être court et normalisé (ex: "caju", "importação/exportação", "logística").
 - Réponds UNIQUEMENT en JSON valide, sans texte avant ni après, sans balises markdown.
 
@@ -162,3 +164,4 @@ export default {
     });
   },
 };
+      
