@@ -1,0 +1,18 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "origem-collector",
+  "main": "src/entry.py",
+  "compatibility_flags": ["python_workers"],
+  "compatibility_date": "2026-07-29",
+  "triggers": {
+    "crons": ["0 6 * * *"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "origeme_db",
+      "database_id": "1dff4862-0d9c-4071-9021-a8d9211aff0a"
+    }
+  ]
+}
+
