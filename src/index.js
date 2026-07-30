@@ -84,6 +84,38 @@ async function obterTexto(src, env) {
   return null;
 }
 
+function scoreDeSinal(texto) {
+  if (!texto || texto.length < 200) return 0;
+  let score = 0;
+  const marcadoresEmpresa = (texto.match(/\b(Lda|SARL|SA|Ltd|Lda\.|Limitada)\b/g) || []).length;
+  score += Math.min(marcadoresEmpresa * 2, 10);
+  const nomesProprios = (texto.match(/\b[A-ZÀ-Ú][a-zà-ú]+(?:\s+[A-ZÀ-Ú][a-zà-ú]+){1,3}\b/g) || []).length;
+  score += Math.min(nomesProprios, 10);
+  const numeros = (texto.match(/\d/g) || []).length;
+  score += Math.min(Math.floor(numeros / 5), 5);
+  if (texto.length > 1500) score += 3;
+  return score;
+}
+
+async function obterTextoComFallback(src, env) {
+  let texto = await obterTexto(src, env);
+  let score = scoreDeSinal(texto);
+
+  // Signal trop faible et methode = extraction directe -> on tente une recherche a la place, automatiquement
+  if (score < 8 && (src.methode === 'tavily_extract' || src.methode === 'scraping_direct')) {
+    const srcFallback = { ...src, methode: 'tavily_search', url: `site:${new URL(src.url.startsWith('http') ? src.url : 'https://' + src.url).hostname} empresa`.replace('site:www.', 'site:') };
+    try {
+      const textoFallback = await obterTexto(srcFallback, env);
+      const scoreFallback = scoreDeSinal(textoFallback);
+      if (scoreFallback > score) {
+        return { texto: textoFallback, score: scoreFallback, fallbackUsado: true };
+      }
+    } catch { /* on garde le texte original si le fallback echoue aussi */ }
+  }
+
+  return { texto, score, fallbackUsado: false };
+}
+
 async function extrairComGroq(texto, env) {
   const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
@@ -158,11 +190,23 @@ async function rodarColeta(env) {
   let totalEncontradas = 0;
   let totalNovas = 0;
   const erros = [];
+  const avisos = [];
 
   for (const src of sourcesDues) {
     try {
-      const texto = await obterTexto(src, env);
-      if (!texto) continue;
+      const { texto, score, fallbackUsado } = await obterTextoComFallback(src, env);
+
+      if (score < 8) {
+        avisos.push(`${src.nom}: signal faible (${score}) même après fallback — méthode probablement à revoir`);
+        await env.DB.prepare(
+          'UPDATE sources_config SET score_dernier_test = ? WHERE id = ?'
+        ).bind(score, src.id).run();
+        continue; // on n'envoie pas du bruit a Groq
+      }
+      if (fallbackUsado) {
+        avisos.push(`${src.nom}: fallback tavily_search utilisé avec succès (score ${score})`);
+      }
+
       const empresas = await extrairComGroq(texto, env);
       for (const emp of empresas) {
         const nova = await gravarEmpresa(emp, src, env);
@@ -170,8 +214,8 @@ async function rodarColeta(env) {
         if (nova) totalNovas++;
       }
       await env.DB.prepare(
-        'UPDATE sources_config SET derniere_execution = ? WHERE id = ?'
-      ).bind(agora, src.id).run();
+        'UPDATE sources_config SET derniere_execution = ?, score_dernier_test = ? WHERE id = ?'
+      ).bind(agora, score, src.id).run();
     } catch (e) {
       erros.push(`${src.nom}: ${e.message}`);
     }
@@ -184,10 +228,10 @@ async function rodarColeta(env) {
     sourcesDues.length ? sourcesDues.map(s => s.nom).join(',') : 'nenhuma',
     totalEncontradas,
     totalNovas,
-    erros.length ? erros.join('; ') : null
+    [...erros, ...avisos].length ? [...erros, ...avisos].join('; ') : null
   ).run();
 
-  return { totalEncontradas, totalNovas, erros };
+  return { totalEncontradas, totalNovas, erros, avisos };
 }
 
 export default {
@@ -201,4 +245,4 @@ export default {
     });
   },
 };
-    
+              
