@@ -1,19 +1,46 @@
-const PROMPT_EXTRACTION = `Tu es un extracteur de données structurées. Tu reçois un texte brut (extrait d'une page web africaine — annuaire, article, ou fiche entreprise) et tu dois en extraire les entreprises mentionnées, uniquement si l'information est explicitement présente dans le texte.
+const PROMPT_EXTRACTION = `Tu es un extracteur de données structurées. Tu reçois un texte brut (extrait d'une page web africaine — annuaire, article, ou fiche entreprise) et tu dois en extraire toutes les entités nommées qui ressemblent à une organisation.
 
-RÈGLES STRICTES :
+RÈGLES :
 - N'invente JAMAIS une information absente du texte. Si un champ n'est pas mentionné, mets null.
-- Un nom d'entreprise doit être un nom propre réel (pas "Empresa X" ou un placeholder).
-- Ignore les mentions génériques.
-- IGNORE TOTALEMENT les ministères, institutions publiques, organismes gouvernementaux, agences d'État, fonds publics et associations professionnelles (ex: MADER, FDA, APIEX, Ministério de..., Instituto Nacional de...). On ne veut QUE des entreprises privées commerciales, jamais une institution qui finance/régule/annonce.
-- Ignore aussi les grandes marques internationales génériques mentionnées en passant (ex: "Microsoft 365" cité comme outil utilisé) — seulement les entreprises qui SONT le sujet de l'article/fiche, pas celles juste mentionnées en référence.
+- Classe CHAQUE entité trouvée dans "tipo_entidade" avec honnêteté — inclue aussi bien les entreprises privées que les institutions, le tri se fait après, pas par toi.
 - Le champ "secteur" doit être court et normalisé (ex: "caju", "importação/exportação", "logística").
-- Réponds UNIQUEMENT en JSON valide, sans texte avant ni après, sans balises markdown.
-
-FORMAT (toujours un tableau, même vide) :
-[{"nom_original": "string", "secteur": "string ou null", "ville": "string ou null", "descricao": "string ou null"}]
 
 TEXTE:
 `;
+
+const SCHEMA_EXTRACAO = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'entidades_extraidas',
+    strict: true,
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        entidades: {
+          type: 'array',
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              nom_original: { type: 'string', description: 'Nom propre exact tel que dans le texte, jamais une description générique' },
+              tipo_entidade: {
+                type: 'string',
+                enum: ['empresa_privada', 'instituicao_publica', 'associacao_ou_ong', 'outro'],
+                description: 'empresa_privada = entreprise commerciale privée uniquement. instituicao_publica = ministère/agence gouvernementale/fundo público. associacao_ou_ong = chambre de commerce, association, ONG.',
+              },
+              secteur: { type: ['string', 'null'] },
+              ville: { type: ['string', 'null'] },
+              descricao: { type: ['string', 'null'] },
+            },
+            required: ['nom_original', 'tipo_entidade', 'secteur', 'ville', 'descricao'],
+          },
+        },
+      },
+      required: ['entidades'],
+    },
+  },
+};
 
 function normalizarNome(nome) {
   let n = nome.toLowerCase().trim();
@@ -65,19 +92,29 @@ async function extrairComGroq(texto, env) {
       'Authorization': `Bearer ${env.GROQ_API_KEY}`,
     },
     body: JSON.stringify({
-      model: 'llama-3.3-70b-versatile',
+      model: 'openai/gpt-oss-120b',
       messages: [{ role: 'user', content: PROMPT_EXTRACTION + texto }],
       temperature: 0,
+      response_format: SCHEMA_EXTRACAO,
     }),
   });
   const data = await resp.json();
-  let conteudo = data.choices[0].message.content.trim();
-  conteudo = conteudo.replace(/^```json/, '').replace(/^```/, '').replace(/```$/, '').trim();
+
+  if (!data.choices || !data.choices[0]) {
+    const motivo = data.error ? data.error.message : JSON.stringify(data).slice(0, 200);
+    throw new Error(`Groq n'a rien renvoyé d'exploitable — ${motivo}`);
+  }
+
+  const conteudo = data.choices[0].message.content;
+  let resultado;
   try {
-    return JSON.parse(conteudo);
+    resultado = JSON.parse(conteudo);
   } catch {
     return [];
   }
+
+  // Couche 2 : le CODE filtre, pas le prompt — on ne garde que les entreprises privées
+  return (resultado.entidades || []).filter(e => e.tipo_entidade === 'empresa_privada');
 }
 
 async function gravarEmpresa(emp, src, env) {
@@ -164,4 +201,4 @@ export default {
     });
   },
 };
-      
+    
