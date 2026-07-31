@@ -1,9 +1,10 @@
-const PROMPT_EXTRACTION = `Tu es un extracteur de données structurées. Tu reçois un texte brut (extrait d'une page web africaine — annuaire, article, ou fiche entreprise) et tu dois en extraire toutes les entités nommées qui ressemblent à une organisation.
+const PROMPT_EXTRACTION = `Tu es un extracteur de données structurées spécialisé dans le commerce des ressources naturelles africaines (agriculture, minerais, énergie, pêche, bois, logistique portuaire liée à ces filières). Tu reçois un texte brut et tu dois en extraire toutes les entités nommées qui ressemblent à une organisation.
 
 RÈGLES :
 - N'invente JAMAIS une information absente du texte. Si un champ n'est pas mentionné, mets null.
 - Classe CHAQUE entité trouvée dans "tipo_entidade" avec honnêteté — inclue aussi bien les entreprises privées que les institutions, le tri se fait après, pas par toi.
-- Le champ "secteur" doit être court et normalisé (ex: "caju", "importação/exportação", "logística").
+- Classe aussi honnêtement "setor_recurso_natural" — si l'entité n'a clairement aucun lien avec les ressources naturelles (ex: cabinet d'avocats généraliste, hôtel, banque de détail), mets "nao_aplicavel". Ne force pas une catégorie qui ne correspond pas.
+- Le champ "secteur" doit être court et normalisé (ex: "caju", "minerais", "logística portuária").
 
 TEXTE:
 `;
@@ -27,13 +28,18 @@ const SCHEMA_EXTRACAO = {
               tipo_entidade: {
                 type: 'string',
                 enum: ['empresa_privada', 'instituicao_publica', 'associacao_ou_ong', 'outro'],
-                description: 'empresa_privada = entreprise commerciale privée uniquement. instituicao_publica = ministère/agence gouvernementale/fundo público. associacao_ou_ong = chambre de commerce, association, ONG.',
+                description: 'empresa_privada = entreprise commerciale privée uniquement.',
+              },
+              setor_recurso_natural: {
+                type: 'string',
+                enum: ['agricultura', 'minerais', 'energia', 'pescas', 'madeira', 'logistica_portuaria', 'nao_aplicavel'],
+                description: 'nao_aplicavel si aucun lien réel avec les ressources naturelles.',
               },
               secteur: { type: ['string', 'null'] },
               ville: { type: ['string', 'null'] },
               descricao: { type: ['string', 'null'] },
             },
-            required: ['nom_original', 'tipo_entidade', 'secteur', 'ville', 'descricao'],
+            required: ['nom_original', 'tipo_entidade', 'setor_recurso_natural', 'secteur', 'ville', 'descricao'],
           },
         },
       },
@@ -145,8 +151,10 @@ async function extrairComGroq(texto, env) {
     return [];
   }
 
-  // Couche 2 : le CODE filtre, pas le prompt — on ne garde que les entreprises privées
-  return (resultado.entidades || []).filter(e => e.tipo_entidade === 'empresa_privada');
+  // Couche 2 : le CODE filtre, pas le prompt — entreprises privées ET liées aux ressources naturelles uniquement
+  return (resultado.entidades || []).filter(
+    e => e.tipo_entidade === 'empresa_privada' && e.setor_recurso_natural !== 'nao_aplicavel'
+  );
 }
 
 async function gravarEmpresa(emp, src, env) {
@@ -174,6 +182,84 @@ async function gravarEmpresa(emp, src, env) {
   ).bind(entreprise.id, src.nom, src.url, src.confiance).run();
 
   return eraNova;
+}
+
+// ---------- ÉTAGE 2 : enrichissement (adresse, téléphone, email) ----------
+
+const SCHEMA_ENRIQUECIMENTO = {
+  type: 'json_schema',
+  json_schema: {
+    name: 'contacto_empresa',
+    strict: true,
+    schema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        encontrado: { type: 'boolean', description: 'true seulement si les infos ci-dessous ont réellement été trouvées dans le texte' },
+        endereco: { type: ['string', 'null'] },
+        telefone: { type: ['string', 'null'] },
+        email: { type: ['string', 'null'] },
+      },
+      required: ['encontrado', 'endereco', 'telefone', 'email'],
+    },
+  },
+};
+
+async function enriquecerEmpresa(empresa, env) {
+  const query = `"${empresa.nom_original}" contacto endereço telefone Moçambique`;
+  const resp = await fetch('https://api.tavily.com/search', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ api_key: env.TAVILY_API_KEY, query, max_results: 5 }),
+  });
+  const data = await resp.json();
+  const texto = (data.results || []).map(r => r.content || '').join(' ').slice(0, 6000);
+  if (!texto || texto.length < 50) return null;
+
+  const respGroq = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${env.GROQ_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: 'openai/gpt-oss-120b',
+      messages: [{
+        role: 'user',
+        content: `Trouve l'adresse, le téléphone et l'email de "${empresa.nom_original}" (entreprise au Mozambique) dans ce texte. N'invente rien — si une info n'est pas explicitement dans le texte, mets null.\n\nTEXTE:\n${texto}`,
+      }],
+      temperature: 0,
+      response_format: SCHEMA_ENRIQUECIMENTO,
+    }),
+  });
+  const dataGroq = await respGroq.json();
+  if (!dataGroq.choices || !dataGroq.choices[0]) return null;
+
+  const resultado = JSON.parse(dataGroq.choices[0].message.content);
+  if (!resultado.encontrado) return null;
+  return resultado;
+}
+
+async function rodarEnriquecimento(env, limite = 5) {
+  const pendentes = await env.DB.prepare(
+    'SELECT * FROM entreprises WHERE enriquecido = 0 ORDER BY id LIMIT ?'
+  ).bind(limite).all();
+
+  let enriquecidas = 0;
+  for (const empresa of pendentes.results) {
+    try {
+      const contacto = await enriquecerEmpresa(empresa, env);
+      if (contacto) {
+        await env.DB.prepare(
+          'UPDATE entreprises SET endereco = ?, telefone = ?, email = ?, enriquecido = 1 WHERE id = ?'
+        ).bind(contacto.endereco, contacto.telefone, contacto.email, empresa.id).run();
+        enriquecidas++;
+      } else {
+        await env.DB.prepare('UPDATE entreprises SET enriquecido = 1 WHERE id = ?').bind(empresa.id).run();
+      }
+    } catch { /* on passe a la suivante, on reessaiera plus tard */ }
+  }
+  return { totalTentadas: pendentes.results.length, enriquecidas };
 }
 
 async function rodarColeta(env) {
@@ -237,12 +323,20 @@ async function rodarColeta(env) {
 export default {
   async scheduled(controller, env, ctx) {
     ctx.waitUntil(rodarColeta(env));
+    ctx.waitUntil(rodarEnriquecimento(env, 10));
   },
   async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (url.searchParams.get('etapa') === '2') {
+      const resultado = await rodarEnriquecimento(env, 5);
+      return new Response(JSON.stringify(resultado, null, 2), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
     const resultado = await rodarColeta(env);
     return new Response(JSON.stringify(resultado, null, 2), {
       headers: { 'Content-Type': 'application/json' },
     });
   },
 };
-              
+      
