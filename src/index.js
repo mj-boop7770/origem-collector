@@ -505,17 +505,24 @@ export default {
   },
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (url.searchParams.get('ver') === 'painel') {
+    const caminho = url.pathname.replace(/\/$/, ''); // retire un slash final eventuel
+
+    // On accepte les deux formes (chemin ET ancien ?ver=/?etapa=) pour ne rien casser
+     const querPainel = caminho === '/painel' || url.searchParams.get('ver') === 'painel';
+    const querEtapa2 = caminho === '/enriquecer' || url.searchParams.get('etapa') === '2';
+    const querEtapa3 = caminho === '/descobrir' || url.searchParams.get('etapa') === '3';
+
+    if (querPainel) {
       const html = await renderPainel(env);
       return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
-    if (url.searchParams.get('etapa') === '2') {
+    if (querEtapa2) {
       const resultado = await rodarEnriquecimento(env, 5);
       return new Response(JSON.stringify(resultado, null, 2), {
         headers: { 'Content-Type': 'application/json' },
       });
     }
-    if (url.searchParams.get('etapa') === '3') {
+    if (querEtapa3) {
       const resultado = await descobrirFontes(env);
       return new Response(JSON.stringify(resultado, null, 2), {
         headers: { 'Content-Type': 'application/json' },
@@ -526,4 +533,4 @@ export default {
       headers: { 'Content-Type': 'application/json' },
     });
   },
-}
+};
