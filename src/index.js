@@ -151,10 +151,8 @@ async function extrairComGroq(texto, env) {
     return [];
   }
 
-  // Couche 2 : le CODE filtre, pas le prompt — entreprises privées ET liées aux ressources naturelles uniquement
-  return (resultado.entidades || []).filter(
-    e => e.tipo_entidade === 'empresa_privada' && e.setor_recurso_natural !== 'nao_aplicavel'
-  );
+  // Étage 1 : on garde TOUT avec les étiquettes — le tri se fait à l'étage 2, pas ici
+  return resultado.entidades || [];
 }
 
 async function gravarEmpresa(emp, src, env) {
@@ -167,10 +165,13 @@ async function gravarEmpresa(emp, src, env) {
   const eraNova = antes === null;
 
   await env.DB.prepare(
-    `INSERT INTO entreprises (nom_normalise, nom_original, secteur, ville)
-     VALUES (?, ?, ?, ?)
+    `INSERT INTO entreprises (nom_normalise, nom_original, secteur, ville, tipo_entidade, setor_recurso_natural)
+     VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT(nom_normalise) DO NOTHING`
-  ).bind(nomeNorm, emp.nom_original, emp.secteur || null, emp.ville || null).run();
+  ).bind(
+    nomeNorm, emp.nom_original, emp.secteur || null, emp.ville || null,
+    emp.tipo_entidade || null, emp.setor_recurso_natural || null
+  ).run();
 
   const entreprise = await env.DB.prepare(
     'SELECT id FROM entreprises WHERE nom_normalise = ?'
@@ -240,9 +241,34 @@ async function enriquecerEmpresa(empresa, env) {
   return resultado;
 }
 
+async function rodarTriagem(env) {
+  // Le vrai tri se fait ici, sur ce qui a deja ete collecte a l'etage 1 — pas en re-cherchant
+  const validadas = await env.DB.prepare(
+    `UPDATE entreprises SET validado = 1
+     WHERE validado = 0 AND tipo_entidade = 'empresa_privada' AND setor_recurso_natural != 'nao_aplicavel'`
+  ).run();
+  const rejeitadas = await env.DB.prepare(
+    `UPDATE entreprises SET validado = -1
+     WHERE validado = 0 AND (tipo_entidade != 'empresa_privada' OR setor_recurso_natural = 'nao_aplicavel')`
+  ).run();
+  return {
+    validadas: validadas.meta.changes || 0,
+    rejeitadas: rejeitadas.meta.changes || 0,
+  };
+}
+
 async function rodarEnriquecimento(env, limite = 5) {
+  const triagem = await rodarTriagem(env);
+
   const pendentes = await env.DB.prepare(
-    'SELECT * FROM entreprises WHERE enriquecido = 0 ORDER BY id LIMIT ?'
+    `SELECT * FROM entreprises WHERE enriquecido = 0 AND validado = 1
+     ORDER BY
+       CASE WHEN secteur LIKE '%import%' OR secteur LIKE '%export%'
+                 OR secteur LIKE '%caju%' OR secteur LIKE '%mineral%'
+                 OR secteur LIKE '%agric%' OR secteur LIKE '%madeira%'
+                 OR secteur LIKE '%pesca%' THEN 0 ELSE 1 END,
+       id
+     LIMIT ?`
   ).bind(limite).all();
 
   let enriquecidas = 0;
@@ -259,7 +285,7 @@ async function rodarEnriquecimento(env, limite = 5) {
       }
     } catch { /* on passe a la suivante, on reessaiera plus tard */ }
   }
-  return { totalTentadas: pendentes.results.length, enriquecidas };
+  return { triagem, totalTentadas: pendentes.results.length, enriquecidas };
 }
 
 async function rodarColeta(env) {
@@ -339,4 +365,4 @@ export default {
     });
   },
 };
-      
+  
