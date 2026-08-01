@@ -509,4 +509,21 @@ export default {
       const html = await renderPainel(env);
       return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
-    if (url.searchParams.get('etapa') === '2
+    if (url.searchParams.get('etapa') === '2') {
+      const resultado = await rodarEnriquecimento(env, 5);
+      return new Response(JSON.stringify(resultado, null, 2), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    if (url.searchParams.get('etapa') === '3') {
+      const resultado = await descobrirFontes(env);
+      return new Response(JSON.stringify(resultado, null, 2), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    const resultado = await rodarColeta(env);
+    return new Response(JSON.stringify(resultado, null, 2), {
+      headers: { 'Content-Type': 'application/json' },
+    });
+  },
+}
