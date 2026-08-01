@@ -122,7 +122,11 @@ async function obterTextoComFallback(src, env) {
   return { texto, score, fallbackUsado: false };
 }
 
-async function extrairComGroq(texto, env) {
+function esperar(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function chamarGroq(texto, env) {
   const resp = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -136,23 +140,43 @@ async function extrairComGroq(texto, env) {
       response_format: SCHEMA_EXTRACAO,
     }),
   });
-  const data = await resp.json();
+  return { status: resp.status, data: await resp.json() };
+}
 
-  if (!data.choices || !data.choices[0]) {
-    const motivo = data.error ? data.error.message : JSON.stringify(data).slice(0, 200);
-    throw new Error(`Groq n'a rien renvoyé d'exploitable — ${motivo}`);
+async function extrairComGroq(texto, env) {
+  let tentativas = 0;
+  let ultimaResposta;
+
+  while (tentativas < 3) {
+    ultimaResposta = await chamarGroq(texto, env);
+    const { status, data } = ultimaResposta;
+
+    if (status === 200 && data.choices && data.choices[0]) {
+      const conteudo = data.choices[0].message.content;
+      try {
+        const resultado = JSON.parse(conteudo);
+        return resultado.entidades || [];
+      } catch {
+        return [];
+      }
+    }
+
+    // Rate limit (429) — on lit le temps d'attente suggere par Groq et on patiente vraiment
+    if (status === 429) {
+      const mensagem = data.error ? data.error.message : '';
+      const match = mensagem.match(/try again in ([\d.]+)s/);
+      const esperaSegundos = match ? parseFloat(match[1]) : 15;
+      await esperar(Math.min(esperaSegundos * 1000 + 500, 60000)); // +0.5s de marge, plafonne a 60s
+      tentativas++;
+      continue;
+    }
+
+    // Autre erreur — pas la peine de reessayer
+    break;
   }
 
-  const conteudo = data.choices[0].message.content;
-  let resultado;
-  try {
-    resultado = JSON.parse(conteudo);
-  } catch {
-    return [];
-  }
-
-  // Étage 1 : on garde TOUT avec les étiquettes — le tri se fait à l'étage 2, pas ici
-  return resultado.entidades || [];
+  const motivo = ultimaResposta.data.error ? ultimaResposta.data.error.message : JSON.stringify(ultimaResposta.data).slice(0, 200);
+  throw new Error(`Groq n'a rien renvoyé d'exploitable après ${tentativas} essai(s) — ${motivo}`);
 }
 
 async function gravarEmpresa(emp, src, env) {
@@ -288,6 +312,133 @@ async function rodarEnriquecimento(env, limite = 5) {
   return { triagem, totalTentadas: pendentes.results.length, enriquecidas };
 }
 
+// ---------- ÉTAGE 3 : découverte de nouvelles sources (jamais activées automatiquement) ----------
+
+const PAISES_ALVO = ['Moçambique', 'Burundi', 'Tanzânia', 'Zâmbia', 'Ruanda', 'África do Sul'];
+const RECURSOS_ALVO = ['minerais', 'café', 'caju', 'madeira', 'pescas', 'algodão', 'gás natural', 'gergelim'];
+const FORMULAS_BUSCA = [
+  (r, p) => `diretório exportadores ${r} ${p}`,
+  (r, p) => `annuaire entreprises ${r} ${p}`,
+  (r, p) => `câmara de comércio ${r} ${p} empresas`,
+  (r, p) => `business directory ${r} exporters ${p}`,
+];
+
+function gerarMatrizDescoberta(limite = 8) {
+  const combinacoes = [];
+  for (const p of PAISES_ALVO) {
+    for (const r of RECURSOS_ALVO) {
+      for (const f of FORMULAS_BUSCA) {
+        combinacoes.push(f(r, p));
+      }
+    }
+  }
+  // On mélange pour ne pas toujours tester les mêmes premiers, et on limite par appel
+  for (let i = combinacoes.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [combinacoes[i], combinacoes[j]] = [combinacoes[j], combinacoes[i]];
+  }
+  return combinacoes.slice(0, limite);
+}
+
+async function descobrirFontes(env) {
+  const candidatas = [];
+  const requetes = gerarMatrizDescoberta(8);
+
+  for (const query of requetes) {
+    try {
+      const resp = await fetch('https://api.tavily.com/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ api_key: env.TAVILY_API_KEY, query, max_results: 5 }),
+      });
+      const data = await resp.json();
+
+      for (const r of (data.results || [])) {
+        const dominio = new URL(r.url).hostname.replace('www.', '');
+        const score = scoreDeSinal(r.content || '');
+        if (score < 5) continue; // trop faible, pas la peine de le proposer
+
+        const existe = await env.DB.prepare(
+          'SELECT id FROM sources_config WHERE url = ?'
+        ).bind(r.url).first();
+        if (existe) continue;
+
+        await env.DB.prepare(
+          `INSERT INTO sources_config (nom, methode, url, confiance, frequence_jours, actif, score_dernier_test)
+           VALUES (?, 'tavily_extract', ?, 'baixa', 30, 0, ?)`
+        ).bind(`candidata_${dominio}_${Date.now()}`, r.url, score).run();
+
+        candidatas.push({ dominio, url: r.url, score });
+      }
+      await esperar(1000); // pause legere entre requetes Tavily
+    } catch { /* on passe a la requete suivante */ }
+  }
+
+  return { candidatasPropostas: candidatas.length, detalhes: candidatas };
+}
+
+async function renderPainel(env) {
+  const totalValidadas = await env.DB.prepare(
+    "SELECT COUNT(*) as n FROM entreprises WHERE validado = 1"
+  ).first();
+  const hoje = await env.DB.prepare(
+    "SELECT COUNT(*) as n FROM entreprises WHERE date(cree_le) = date('now')"
+  ).first();
+  const recentes = await env.DB.prepare(
+    "SELECT nom_original, secteur, ville, endereco, telefone, cree_le FROM entreprises WHERE validado = 1 ORDER BY id DESC LIMIT 20"
+  ).all();
+  const ultimosRuns = await env.DB.prepare(
+    "SELECT date_run, source_nom, entreprises_trouvees, entreprises_nouvelles, erreurs FROM runs_log ORDER BY date_run DESC LIMIT 8"
+  ).all();
+  const candidatas = await env.DB.prepare(
+    "SELECT nom, url, score_dernier_test FROM sources_config WHERE actif = 0 ORDER BY score_dernier_test DESC LIMIT 15"
+  ).all();
+
+  const linhaEmpresa = e => `<tr>
+    <td>${e.nom_original}</td><td>${e.secteur || '—'}</td><td>${e.ville || '—'}</td>
+    <td>${e.telefone || e.endereco ? '✅' : '—'}</td><td class="mono">${(e.cree_le || '').slice(0, 10)}</td>
+  </tr>`;
+  const linhaRun = r => `<tr>
+    <td class="mono">${(r.date_run || '').slice(0, 16)}</td><td>${r.entreprises_nouvelles}</td>
+    <td>${r.erreurs ? '⚠️' : '✅'}</td>
+  </tr>`;
+  const linhaCandidata = c => `<tr><td>${c.nom}</td><td class="mono">${c.score_dernier_test ?? '—'}</td></tr>`;
+
+  return `<!DOCTYPE html><html lang="pt"><head><meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Origem — Painel</title>
+  <style>
+    body{font-family:-apple-system,sans-serif;background:#14161A;color:#EDEDE9;margin:0;padding:16px;}
+    h1{font-size:20px;} h2{font-size:15px;color:#C9902F;margin-top:28px;}
+    .cards{display:flex;gap:10px;margin:14px 0;}
+    .card{background:#1B1E24;border:1px solid #2A2E36;border-radius:12px;padding:14px;flex:1;text-align:center;}
+    .card b{font-size:26px;display:block;color:#7A9B76;}
+    table{width:100%;border-collapse:collapse;font-size:13px;margin-top:8px;}
+    th,td{padding:6px 8px;text-align:left;border-bottom:1px solid #2A2E36;}
+    th{color:#9AA0AC;font-weight:500;}
+    .mono{font-family:monospace;font-size:11px;color:#9AA0AC;}
+  </style></head><body>
+  <h1>🐙 Origem — Painel de coleta</h1>
+  <div class="cards">
+    <div class="card"><b>${totalValidadas.n}</b>empresas validadas</div>
+    <div class="card"><b>${hoje.n}</b>hoje</div>
+    <div class="card"><b>${candidatas.results.length}</b>fontes candidatas</div>
+  </div>
+
+  <h2>Últimas empresas</h2>
+  <table><tr><th>Nome</th><th>Setor</th><th>Cidade</th><th>Contacto</th><th>Data</th></tr>
+  ${recentes.results.map(linhaEmpresa).join('')}</table>
+
+  <h2>Últimas execuções</h2>
+  <table><tr><th>Quando</th><th>Novas</th><th>Estado</th></tr>
+  ${ultimosRuns.results.map(linhaRun).join('')}</table>
+
+  <h2>Fontes candidatas (por ativar)</h2>
+  <table><tr><th>Nome</th><th>Score</th></tr>
+  ${candidatas.results.map(linhaCandidata).join('') || '<tr><td colspan="2">Nenhuma por enquanto</td></tr>'}</table>
+  </body></html>`;
+}
+
 async function rodarColeta(env) {
   const agora = new Date().toISOString();
 
@@ -328,6 +479,7 @@ async function rodarColeta(env) {
       await env.DB.prepare(
         'UPDATE sources_config SET derniere_execution = ?, score_dernier_test = ? WHERE id = ?'
       ).bind(agora, score, src.id).run();
+      await esperar(25000); // ~2 appels/minute max pour rester sous 8000 tokens/min Groq
     } catch (e) {
       erros.push(`${src.nom}: ${e.message}`);
     }
@@ -353,16 +505,8 @@ export default {
   },
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (url.searchParams.get('etapa') === '2') {
-      const resultado = await rodarEnriquecimento(env, 5);
-      return new Response(JSON.stringify(resultado, null, 2), {
-        headers: { 'Content-Type': 'application/json' },
-      });
+    if (url.searchParams.get('ver') === 'painel') {
+      const html = await renderPainel(env);
+      return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
     }
-    const resultado = await rodarColeta(env);
-    return new Response(JSON.stringify(resultado, null, 2), {
-      headers: { 'Content-Type': 'application/json' },
-    });
-  },
-};
-  
+    if (url.searchParams.get('etapa') === '2
